@@ -1,0 +1,6 @@
+data/raw/
+data/derived/
+logs/
+*.ckpt
+*.pt
+*.bin

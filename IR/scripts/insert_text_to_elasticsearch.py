@@ -16,6 +16,8 @@ except ImportError:
 # sentences and issues bulk insert commands to an Elasticsearch server running
 # on localhost.
 
+import argparse
+
 ELASTIC_SEARCH_URL = 'http://localhost:9200/knowledge/sentence/_bulk'
 DOCUMENTS_PER_POST = 100000
 
@@ -56,11 +58,22 @@ def groups(stream, size):
     yield batch
 
 def main():
+  parser = argparse.ArgumentParser(description='Insert text to Elasticsearch')
+  parser.add_argument('--url', default='http://localhost:9200/knowledge/sentence/_bulk',
+                     help='Elasticsearch URL (default: http://localhost:9200/knowledge/sentence/_bulk)')
+  parser.add_argument('--skip-elasticsearch', action='store_true',
+                     help='Skip Elasticsearch and just output sentence count')
+  args = parser.parse_args()
+  
   sentence_count = 0
 
   for sentences in groups(lines_to_sentences(sys.stdin), DOCUMENTS_PER_POST):
-    bulk_load_elasticsearch(sentences, ELASTIC_SEARCH_URL)
-    sentence_count += len(sentences)
+    if args.skip_elasticsearch:
+      # Just count sentences without sending to Elasticsearch
+      sentence_count += len(sentences)
+    else:
+      bulk_load_elasticsearch(sentences, args.url)
+      sentence_count += len(sentences)
 
   print("Documents posted:", sentence_count)
 
