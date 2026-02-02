@@ -75,8 +75,8 @@ def iter_jsonl_records(path: str, encoding: str) -> Iterator[Tuple[int, Any]]:
                 continue
             try:
                 yield line_no, json.loads(s)
-            except Exception:
-                yield line_no, {"text": s, "_parse_error": "invalid_json"}
+            except json.JSONDecodeError as e:
+                yield line_no, {"text": s, "_parse_error": f"invalid_json: {e}"}
 
 
 def iter_txt_records(path: str, encoding: str, min_line_length: int) -> Iterator[Tuple[int, Dict[str, Any]]]:
@@ -131,21 +131,26 @@ def extract_text_from_record(
     include_fields: Optional[Sequence[str]],
     exclude_fields: Sequence[str],
 ) -> str:
-    if isinstance(record, dict):
-        if include_fields:
-            subset: Dict[str, Any] = {}
-            for field in include_fields:
-                if field in record:
-                    subset[field] = record[field]
-            return " ".join(flatten_strings(subset, max_items))
-        if exclude_fields:
-            filtered: Dict[str, Any] = {}
-            for k, v in record.items():
-                if k in exclude_fields:
-                    continue
-                filtered[k] = v
-            return " ".join(flatten_strings(filtered, max_items))
-    return " ".join(flatten_strings(record, max_items))
+    if not isinstance(record, dict):
+        return " ".join(flatten_strings(record, max_items))
+    
+    filtered = _filter_record_fields(record, include_fields, exclude_fields)
+    return " ".join(flatten_strings(filtered, max_items))
+
+
+def _filter_record_fields(
+    record: Dict[str, Any],
+    include_fields: Optional[Sequence[str]],
+    exclude_fields: Sequence[str],
+) -> Any:
+    """Helper function to filter record fields."""
+    if include_fields:
+        return {field: record[field] for field in include_fields if field in record}
+    
+    if exclude_fields:
+        return {k: v for k, v in record.items() if k not in exclude_fields}
+    
+    return record
 
 
 def filter_record_for_output(
@@ -155,23 +160,7 @@ def filter_record_for_output(
 ) -> Any:
     if not isinstance(record, dict):
         return record
-
-    if include_fields:
-        subset: Dict[str, Any] = {}
-        for field in include_fields:
-            if field in record:
-                subset[field] = record[field]
-        return subset
-
-    if exclude_fields:
-        filtered: Dict[str, Any] = {}
-        for k, v in record.items():
-            if k in exclude_fields:
-                continue
-            filtered[k] = v
-        return filtered
-
-    return record
+    return _filter_record_fields(record, include_fields, exclude_fields)
 
 
 def build_matcher(keywords: Sequence[str]) -> Tuple[re.Pattern, List[str]]:
@@ -180,6 +169,9 @@ def build_matcher(keywords: Sequence[str]) -> Tuple[re.Pattern, List[str]]:
         kw = kw.strip()
         if kw:
             cleaned.append(kw)
+    
+    if not cleaned:
+        return re.compile(r"(?!.*)", re.IGNORECASE), []
 
     parts: List[str] = []
     for kw in cleaned:
@@ -219,6 +211,18 @@ def ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def _load_json_file(path: str, encoding: str) -> List[Tuple[int, Any]]:
+    """Safely load a JSON file and return as a list of records."""
+    try:
+        with open(path, "r", encoding=encoding, errors="replace") as f:
+            obj = json.load(f)
+            return [(1, obj)]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in file '{path}': {e}")
+    except IOError as e:
+        raise IOError(f"Failed to read file '{path}': {e}")
 
 
 def main() -> int:
@@ -299,23 +303,28 @@ def main() -> int:
 
     allowed_exts = tuple(ext.strip().lower() for ext in args.extensions.split(",") if ext.strip())
     if not allowed_exts:
-        raise SystemExit("--extensions cannot be empty")
+        raise SystemExit("Error: --extensions cannot be empty")
 
+    # Build keywords list
+    keywords_list: List[str] = []
     if args.keywords.strip():
-        keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+        keywords_list = [k.strip() for k in args.keywords.split(",") if k.strip()]
     else:
-        keywords: List[str] = []
         if args.language in ("en", "both"):
-            keywords.extend(DEFAULT_KEYWORDS_EN)
+            keywords_list.extend(DEFAULT_KEYWORDS_EN)
         if args.language in ("zh", "both"):
-            keywords.extend(DEFAULT_KEYWORDS_ZH)
+            keywords_list.extend(DEFAULT_KEYWORDS_ZH)
 
-    pattern, normalized_keywords = build_matcher(keywords)
+    pattern, normalized_keywords = build_matcher(keywords_list)
     if not normalized_keywords:
-        raise SystemExit("No keywords provided.")
+        raise SystemExit("Error: No keywords provided or all keywords were empty.")
 
     include_fields = [f.strip() for f in args.fields.split(",") if f.strip()] or None
     exclude_fields = [] if args.include_meta_info else ["meta_info"]
+
+    # Validate max_records
+    if args.max_records < 0:
+        raise SystemExit("Error: --max-records must be non-negative")
 
     total_records = 0
     matched_records = 0
@@ -323,26 +332,28 @@ def main() -> int:
 
     out_f = None
     if not args.dry_run:
-        ensure_parent_dir(args.output)
-        out_f = open(args.output, "w", encoding="utf-8")
+        try:
+            ensure_parent_dir(args.output)
+            out_f = open(args.output, "w", encoding="utf-8")
+        except IOError as e:
+            raise SystemExit(f"Error: Failed to open output file '{args.output}': {e}")
 
     try:
         for path in iter_files(args.input, allowed_exts):
             scanned_files += 1
             ext = os.path.splitext(path)[1].lower()
 
-            if ext == ".jsonl":
-                record_iter: Iterable[Tuple[int, Any]] = iter_jsonl_records(path, args.encoding)
-            elif ext == ".txt":
-                record_iter = iter_txt_records(path, args.encoding, args.min_line_length)
-            elif ext == ".json":
-                with open(path, "r", encoding=args.encoding, errors="replace") as f:
-                    try:
-                        obj = json.load(f)
-                        record_iter = [(1, obj)]
-                    except Exception:
-                        record_iter = [(1, {"text": f.read(), "_parse_error": "invalid_json"})]
-            else:
+            try:
+                if ext == ".jsonl":
+                    record_iter: Iterable[Tuple[int, Any]] = iter_jsonl_records(path, args.encoding)
+                elif ext == ".txt":
+                    record_iter = iter_txt_records(path, args.encoding, args.min_line_length)
+                elif ext == ".json":
+                    record_iter = _load_json_file(path, args.encoding)
+                else:
+                    continue
+            except (IOError, ValueError) as e:
+                print(f"Warning: Skipping file '{path}': {e}", flush=True)
                 continue
 
             for line_no, record in record_iter:
@@ -378,13 +389,25 @@ def main() -> int:
                     out_record = {"raw": filtered_record, "_extract_meta": meta}
 
                 if out_f is not None:
-                    out_f.write(json.dumps(out_record, ensure_ascii=False) + "\n")
+                    try:
+                        out_f.write(json.dumps(out_record, ensure_ascii=False) + "\n")
+                    except IOError as e:
+                        raise SystemExit(f"Error: Failed to write to output file: {e}")
 
             if args.max_records and total_records >= args.max_records:
                 break
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.", flush=True)
+        return 1
+    except Exception as e:
+        print(f"Error: Unexpected error during processing: {e}", flush=True)
+        return 1
     finally:
         if out_f is not None:
-            out_f.close()
+            try:
+                out_f.close()
+            except IOError as e:
+                print(f"Warning: Error closing output file: {e}", flush=True)
 
     print(f"Scanned files: {scanned_files}")
     print(f"Total records/lines scanned: {total_records}")
